@@ -1,5 +1,6 @@
 .env
 captures/
 greenhouse_log.json
+test_plant.jpg
 __pycache__/
 *.pyc
