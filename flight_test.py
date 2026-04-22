@@ -5,15 +5,15 @@ At each rack stop the drone captures a frame and sends it to Claude
 for plant-health analysis. Results are saved to a timestamped session folder.
 
 Requires:
-    pip install djitellopy anthropic opencv-python
+    pip install djitellopy anthropic opencv-python python-dotenv
 
-Set your Anthropic API key before running:
-    Windows:   set ANTHROPIC_API_KEY=sk-...
-    Mac/Linux: export ANTHROPIC_API_KEY=sk-...
+Set your Anthropic API key in .env:
+    ANTHROPIC_API_KEY=sk-ant-...
 """
 
 from djitellopy import Tello
 from dotenv import load_dotenv
+from typing import Optional
 import anthropic
 import cv2
 import base64
@@ -29,10 +29,11 @@ load_dotenv()
 # ── Config — edit these to match your greenhouse layout ──────────────────────
 RACK_STOPS        = 3     # 3 rack positions per pass (each shelf)
 GREENHOUSE_LENGTH = 355   # cm — one-way length of the rack row
-SHELF1_HEIGHT     = 114   # cm from ground (45 in) — first-shelf pass height
-SHELF2_HEIGHT     = 178   # cm from ground (70 in) — second-shelf pass height
+SHELF1_HEIGHT     = 114   # cm rise after takeoff to reach shelf 1 (45 in)
+SHELF2_HEIGHT     = 178   # cm total rise from ground to shelf 2 (70 in)
 HOVER_SECONDS     = 3     # seconds to hover before capture at each stop
 BATTERY_THRESHOLD = 25    # % — aborts mission if reached mid-flight
+FRAMES_PER_STOP   = 5     # frames sampled per stop; sharpest one is kept
 CAPTURES_DIR      = "captures"  # root folder for saved images and reports
 AI_MODEL          = "claude-opus-4-7"
 # ─────────────────────────────────────────────────────────────────────────────
@@ -58,7 +59,7 @@ def preflight_check(drone: Tello) -> bool:
     print(f"  Rack stops/pass:   {RACK_STOPS}  ({STOP_DISTANCE} cm apart)")
     print(f"  Shelf 1 height:    {SHELF1_HEIGHT} cm  (45 in) — fly LEFT")
     print(f"  Shelf 2 height:    {SHELF2_HEIGHT} cm  (70 in) — fly RIGHT")
-    print(f"  Hover/stop:        {HOVER_SECONDS} sec + capture + AI analysis")
+    print(f"  Hover/stop:        {HOVER_SECONDS} sec + {FRAMES_PER_STOP}-frame capture + AI analysis")
     print(f"  AI model:          {AI_MODEL}")
     print(f"  RTH threshold:     {BATTERY_THRESHOLD}%")
     print(f"\nDrone will fly LEFT at shelf-1 height, then RIGHT at shelf-2 height back to start.")
@@ -67,18 +68,38 @@ def preflight_check(drone: Tello) -> bool:
     return confirm == "yes"
 
 
-def capture_frame(drone: Tello, save_path: str) -> bool:
-    """Grab current video frame and save it as a JPEG."""
+def capture_best_frame(drone: Tello) -> Optional[object]:
+    """
+    Sample FRAMES_PER_STOP frames from the video stream and return the
+    sharpest one, scored by Laplacian variance (high variance = sharp focus).
+    Returns None if the stream yields no usable frames.
+    """
     frame_reader = drone.get_frame_read()
-    frame = frame_reader.frame
-    if frame is None:
-        return False
-    success, _ = cv2.imwrite(save_path, frame)
-    return success
+    best_frame = None
+    best_score = -1.0
+
+    for _ in range(FRAMES_PER_STOP):
+        frame = frame_reader.frame
+        if frame is None:
+            time.sleep(0.1)
+            continue
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        score = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+        if score > best_score:
+            best_score = score
+            best_frame = frame.copy()  # .copy() prevents overwrite by next frame
+        time.sleep(0.1)
+
+    if best_frame is not None:
+        print(f"    Captured frame  (sharpness score: {best_score:.1f})")
+    else:
+        print(f"    WARNING: all frames were None — stream may not be ready")
+
+    return best_frame
 
 
 def analyze_image(client: anthropic.Anthropic, image_path: str, label: str) -> str:
-    """Send a captured frame to Claude and return a plant-health assessment."""
+    """Send a saved frame to Claude and return a plant-health assessment."""
     with open(image_path, "rb") as f:
         image_data = base64.standard_b64encode(f.read()).decode("utf-8")
 
@@ -121,16 +142,18 @@ def capture_and_analyze(
     label: str,
     session_dir: Path,
 ) -> dict:
-    """Capture a frame at the current stop, analyze it, and return a result dict."""
+    """Capture the sharpest frame at the current stop, analyze it, return result dict."""
     filename = f"{label.replace(' ', '_').lower()}.jpg"
     image_path = session_dir / filename
 
-    print(f"    Capturing image...")
-    captured = capture_frame(drone, str(image_path))
+    print(f"    Selecting sharpest frame from {FRAMES_PER_STOP} samples...")
+    frame = capture_best_frame(drone)
 
-    if not captured:
-        print(f"    WARNING: frame capture failed — skipping analysis")
+    if frame is None:
+        print(f"    WARNING: no usable frame — skipping analysis")
         return {"label": label, "image": None, "analysis": "capture failed"}
+
+    cv2.imwrite(str(image_path), frame)
 
     print(f"    Analyzing with Claude ({AI_MODEL})...")
     try:
@@ -151,11 +174,12 @@ def fly_pass(
     session_dir: Path,
 ) -> tuple[int, bool, list]:
     """
-    Fly one pass across the greenhouse.
-    At each stop: hover, capture a frame, send to Claude for analysis.
+    Fly one pass across the greenhouse, capturing and analyzing at each stop.
 
     Returns:
-        steps_taken, aborted, results_list
+        steps_taken — moves completed before finish or abort
+        aborted     — True if stopped early due to low battery
+        results     — list of capture/analysis dicts
     """
     move_fn = drone.move_left if direction == "left" else drone.move_right
     steps_taken = 0
@@ -195,7 +219,7 @@ def fly_mission(drone: Tello, client: anthropic.Anthropic, session_dir: Path) ->
 
     print("\nStarting video stream...")
     drone.streamon()
-    time.sleep(1)  # let stream stabilize before first frame
+    time.sleep(2)  # 2 seconds for stream to fully stabilize before first frame
 
     print("\nTaking off...")
     drone.takeoff()
@@ -212,6 +236,17 @@ def fly_mission(drone: Tello, client: anthropic.Anthropic, session_dir: Path) ->
     summary["shelf1_aborted"] = aborted1
     summary["shelf1_results"] = results1
 
+    # ── If pass 1 aborted, go straight home — do not attempt pass 2 ──────────
+    if aborted1:
+        if steps1 > 0:
+            print(f"\n  Pass 1 aborted — moving right {steps1 * STOP_DISTANCE} cm to reach home...")
+            drone.move_right(steps1 * STOP_DISTANCE)
+            time.sleep(1)
+        print("\nLanding...")
+        drone.land()
+        drone.streamoff()
+        return summary
+
     # ── Rise additional height to shelf-2 level ───────────────────────────────
     rise_extra = SHELF2_HEIGHT - SHELF1_HEIGHT  # 64 cm
     print(f"\nRising to shelf-2 height: {SHELF2_HEIGHT} cm (70 in)  (+{rise_extra} cm)...")
@@ -225,19 +260,12 @@ def fly_mission(drone: Tello, client: anthropic.Anthropic, session_dir: Path) ->
     summary["shelf2_aborted"] = aborted2
     summary["shelf2_results"] = results2
 
-    # ── Return home if either pass aborted early ──────────────────────────────
+    # ── If pass 2 aborted, cover remaining distance to reach home ─────────────
     if aborted2:
         remaining = (RACK_STOPS - steps2) * STOP_DISTANCE
         if remaining > 0:
             print(f"\n  Pass 2 aborted — moving right {remaining} cm to reach home...")
             drone.move_right(remaining)
-            time.sleep(1)
-
-    if aborted1:
-        return_dist = steps1 * STOP_DISTANCE
-        if return_dist > 0:
-            print(f"\n  Pass 1 aborted — moving right {return_dist} cm to reach home...")
-            drone.move_right(return_dist)
             time.sleep(1)
 
     print("\nLanding...")
@@ -276,9 +304,7 @@ def save_report(summary: dict, session_dir: Path) -> None:
 def main():
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
-        print("ERROR: ANTHROPIC_API_KEY environment variable not set.")
-        print("  Windows:   set ANTHROPIC_API_KEY=sk-...")
-        print("  Mac/Linux: export ANTHROPIC_API_KEY=sk-...")
+        print("ERROR: ANTHROPIC_API_KEY not set. Fill in your .env file.")
         sys.exit(1)
 
     client = anthropic.Anthropic(api_key=api_key)

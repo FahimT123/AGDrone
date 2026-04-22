@@ -1,14 +1,18 @@
 """
-Greenhouse Monitor — Full Pipeline
-------------------------------------
-Flies the rack path, queues frames at each stop, then analyzes everything
-with Claude Vision after the drone has landed.
+Greenhouse Monitor — Post-Landing Analysis Pipeline
+-----------------------------------------------------
+Flies the two-shelf rack path and queues frames at each stop, then
+analyzes everything with Claude Vision after the drone has landed.
 
-The flight loop never blocks on the API — frames are stored in memory during
-the mission and sent to Claude only once the drone is safely on the ground.
+The flight loop never blocks on the API — frames are stored in memory
+during the mission and sent to Claude only once the drone is safely on
+the ground. This keeps hover timing consistent and minimizes air time.
 
 Requires:
-    pip install djitellopy opencv-python anthropic
+    pip install djitellopy opencv-python anthropic python-dotenv
+
+Set your Anthropic API key in .env:
+    ANTHROPIC_API_KEY=sk-ant-...
 
 Usage:
     python greenhouse_monitor.py
@@ -21,6 +25,7 @@ from datetime import datetime
 from typing import Optional
 import base64
 import json
+import os
 import sys
 import time
 
@@ -32,16 +37,19 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ── Config — edit these to match your greenhouse layout ──────────────────────
-RACK_STOPS        = 3     # number of rack positions to visit
-STOP_DISTANCE     = 50    # cm between each rack stop
-RISE_HEIGHT       = 60    # cm to rise after takeoff
+RACK_STOPS        = 3     # 3 rack positions per pass (each shelf)
+GREENHOUSE_LENGTH = 355   # cm — one-way length of the rack row
+SHELF1_HEIGHT     = 114   # cm rise after takeoff to reach shelf 1 (45 in)
+SHELF2_HEIGHT     = 178   # cm total rise from ground to shelf 2 (70 in)
 HOVER_SECONDS     = 3     # seconds to hover at each stop before capturing
-BATTERY_THRESHOLD = 25    # % — triggers RTH if reached before any move
+BATTERY_THRESHOLD = 25    # % — aborts mission if reached mid-flight
 FRAMES_PER_STOP   = 5     # frames sampled per stop; sharpest one is kept
 LOG_FILE          = "greenhouse_log.json"
-CLAUDE_MODEL      = "claude-sonnet-4-6"
+CLAUDE_MODEL      = "claude-opus-4-7"
 MAX_TOKENS        = 500
 # ─────────────────────────────────────────────────────────────────────────────
+
+STOP_DISTANCE = GREENHOUSE_LENGTH // RACK_STOPS  # 118 cm between stops
 
 
 # ── Data classes ──────────────────────────────────────────────────────────────
@@ -49,16 +57,20 @@ MAX_TOKENS        = 500
 @dataclass
 class StopCapture:
     """A single frame captured at one rack stop, waiting for analysis."""
+    shelf: int
     rack_position: int
+    label: str
     timestamp: str
     battery_at_capture: int
-    frame: object          # numpy ndarray — kept in memory, never written to disk
+    frame: object  # numpy ndarray — kept in memory, never written to disk
 
 
 @dataclass
 class AnalysisResult:
     """The Claude response for one rack stop, ready to log."""
+    shelf: int
     rack_position: int
+    label: str
     timestamp: str
     battery_at_capture: int
     analysis: str
@@ -70,7 +82,6 @@ def capture_best_frame(drone: Tello) -> Optional[object]:
     """
     Sample FRAMES_PER_STOP frames from the live stream and return the sharpest
     one, scored by Laplacian variance (high variance = sharp edges = good focus).
-
     Returns None if the stream yields no usable frames.
     """
     frame_reader = drone.get_frame_read()
@@ -79,27 +90,20 @@ def capture_best_frame(drone: Tello) -> Optional[object]:
 
     for _ in range(FRAMES_PER_STOP):
         frame = frame_reader.frame
-
-        # Stream can return None briefly on startup or connection hiccup
         if frame is None:
             time.sleep(0.1)
             continue
-
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         score = float(cv2.Laplacian(gray, cv2.CV_64F).var())
-
         if score > best_score:
             best_score = score
-            # .copy() is critical — without it the array is a view into the
-            # frame buffer and will be overwritten by the next frame
-            best_frame = frame.copy()
-
-        time.sleep(0.1)   # stay within stream update rate (~30 fps)
+            best_frame = frame.copy()  # .copy() prevents overwrite by next frame
+        time.sleep(0.1)
 
     if best_frame is None:
-        print("  WARNING: all frames were None — stream may not be ready yet")
+        print("    WARNING: all frames were None — stream may not be ready")
     else:
-        print(f"  Captured frame (sharpness: {best_score:.1f})")
+        print(f"    Captured frame  (sharpness score: {best_score:.1f})")
 
     return best_frame
 
@@ -138,7 +142,7 @@ def analyze_plant(capture: StopCapture, client: anthropic.Anthropic) -> str:
                 },
                 {
                     "type": "text",
-                    "text": ANALYSIS_PROMPT,
+                    "text": f"You are analyzing {capture.label} in a greenhouse. {ANALYSIS_PROMPT}",
                 },
             ],
         }],
@@ -149,80 +153,128 @@ def analyze_plant(capture: StopCapture, client: anthropic.Anthropic) -> str:
 # ── Logging ───────────────────────────────────────────────────────────────────
 
 def log_result(result: AnalysisResult) -> None:
-    """Append one result to the JSONL log file and print a summary to stdout."""
+    """Append one result to the JSONL log file and print a summary."""
     record = {
         "timestamp":          result.timestamp,
+        "shelf":              result.shelf,
         "rack_position":      result.rack_position,
+        "label":              result.label,
         "battery_at_capture": result.battery_at_capture,
         "analysis":           result.analysis,
     }
     with open(LOG_FILE, "a") as f:
         f.write(json.dumps(record) + "\n")
 
-    print(f"\n── Rack {result.rack_position}  (battery at capture: {result.battery_at_capture}%) ──")
+    print(f"\n── {result.label}  (battery at capture: {result.battery_at_capture}%) ──")
     print(result.analysis)
 
 
 # ── Flight loop ───────────────────────────────────────────────────────────────
 
-def fly_and_capture(drone: Tello) -> list[StopCapture]:
+def fly_pass_and_capture(
+    drone: Tello,
+    direction: str,
+    shelf: int,
+) -> tuple[list[StopCapture], bool]:
     """
-    Fly the full rack path and collect one frame per stop.
+    Fly one pass across the greenhouse collecting frames — no API calls.
 
-    Deliberately does NOT call the Claude API — keeping the flight loop free
-    of network I/O means the drone spends the minimum time in the air and the
-    hover timing stays predictable. All analysis happens post-landing.
-
-    Returns a list of StopCapture objects (one per stop reached).
+    Returns:
+        captures — list of StopCapture objects for this pass
+        aborted  — True if the pass ended early due to low battery
     """
-    captures: list[StopCapture] = []
+    move_fn = drone.move_left if direction == "left" else drone.move_right
+    captures = []
     steps_taken = 0
-
-    print("\nTaking off...")
-    drone.takeoff()
-    time.sleep(1)
-
-    print(f"Rising {RISE_HEIGHT} cm to rack height...")
-    drone.move_up(RISE_HEIGHT)
-    time.sleep(1)
+    aborted = False
+    shelf_label = f"Shelf {shelf}"
 
     for i in range(RACK_STOPS):
         battery = drone.get_battery()
-        print(f"\n[Stop {i + 1}/{RACK_STOPS}]  Battery: {battery}%")
+        stop_label = f"{shelf_label} Stop {i + 1}"
+        print(f"\n  [{stop_label}]  Battery: {battery}%")
 
         if battery < BATTERY_THRESHOLD:
-            print(f"  Low battery ({battery}%) — aborting mission before this move")
+            print(f"  Low battery ({battery}%) — aborting pass before this move")
+            aborted = True
             break
 
-        print(f"  Moving forward {STOP_DISTANCE} cm...")
-        drone.move_forward(STOP_DISTANCE)
+        print(f"  Moving {direction} {STOP_DISTANCE} cm...")
+        move_fn(STOP_DISTANCE)
         steps_taken += 1
 
-        # Let the drone fully stabilize before capturing — reduces motion blur
-        print(f"  Stabilizing {HOVER_SECONDS} sec...")
+        print(f"  Stabilizing {HOVER_SECONDS} sec before capture...")
         time.sleep(HOVER_SECONDS)
 
         frame = capture_best_frame(drone)
         if frame is not None:
             captures.append(StopCapture(
+                shelf=shelf,
                 rack_position=i + 1,
+                label=stop_label,
                 timestamp=datetime.now().isoformat(),
                 battery_at_capture=drone.get_battery(),
                 frame=frame,
             ))
+        print(f"  Stop {i + 1} complete")
 
-    # ── Return home ───────────────────────────────────────────────────────────
-    if steps_taken > 0:
-        return_distance = steps_taken * STOP_DISTANCE
-        print(f"\nReturning home — moving back {return_distance} cm...")
-        drone.move_back(return_distance)
-        time.sleep(1)
+    return captures, aborted, steps_taken
 
-    print("Landing...")
+
+def fly_and_capture(drone: Tello) -> list[StopCapture]:
+    """
+    Fly the full two-shelf path and collect frames at every stop.
+    No Claude API calls here — all analysis happens after landing.
+
+    Returns a list of all StopCapture objects collected across both passes.
+    """
+    all_captures = []
+
+    print("\nTaking off...")
+    drone.takeoff()
+    time.sleep(1)
+
+    # ── Pass 1: rise to shelf-1 height, fly LEFT ──────────────────────────────
+    print(f"\nRising to shelf-1 height: {SHELF1_HEIGHT} cm (45 in)...")
+    drone.move_up(SHELF1_HEIGHT)
+    time.sleep(1)
+
+    print(f"\n── Pass 1: Shelf 1 — flying LEFT {GREENHOUSE_LENGTH} cm ──")
+    captures1, aborted1, steps1 = fly_pass_and_capture(drone, "left", shelf=1)
+    all_captures.extend(captures1)
+
+    if aborted1:
+        if steps1 > 0:
+            print(f"\n  Pass 1 aborted — moving right {steps1 * STOP_DISTANCE} cm to reach home...")
+            drone.move_right(steps1 * STOP_DISTANCE)
+            time.sleep(1)
+        print("\nLanding...")
+        drone.land()
+        drone.streamoff()
+        return all_captures
+
+    # ── Pass 2: rise to shelf-2 height, fly RIGHT (returns to start) ──────────
+    rise_extra = SHELF2_HEIGHT - SHELF1_HEIGHT  # 64 cm
+    print(f"\nRising to shelf-2 height: {SHELF2_HEIGHT} cm (70 in)  (+{rise_extra} cm)...")
+    drone.move_up(rise_extra)
+    time.sleep(1)
+
+    print(f"\n── Pass 2: Shelf 2 — flying RIGHT {GREENHOUSE_LENGTH} cm ──")
+    captures2, aborted2, steps2 = fly_pass_and_capture(drone, "right", shelf=2)
+    all_captures.extend(captures2)
+
+    if aborted2:
+        remaining = (RACK_STOPS - steps2) * STOP_DISTANCE
+        if remaining > 0:
+            print(f"\n  Pass 2 aborted — moving right {remaining} cm to reach home...")
+            drone.move_right(remaining)
+            time.sleep(1)
+
+    print("\nLanding...")
     drone.land()
     drone.streamoff()
 
-    return captures
+    return all_captures
 
 
 # ── Post-landing analysis ─────────────────────────────────────────────────────
@@ -236,15 +288,17 @@ def analyze_all(captures: list[StopCapture]) -> list[AnalysisResult]:
         print("\nNo frames captured — nothing to analyze.")
         return []
 
-    print(f"\nDrone landed. Sending {len(captures)} frame(s) to Claude...")
+    print(f"\nDrone landed. Sending {len(captures)} frame(s) to Claude ({CLAUDE_MODEL})...")
     client = anthropic.Anthropic()
     results: list[AnalysisResult] = []
 
     for capture in captures:
-        print(f"  Analyzing rack {capture.rack_position}...")
+        print(f"\n  Analyzing {capture.label}...")
         analysis_text = analyze_plant(capture, client)
         result = AnalysisResult(
+            shelf=capture.shelf,
             rack_position=capture.rack_position,
+            label=capture.label,
             timestamp=capture.timestamp,
             battery_at_capture=capture.battery_at_capture,
             analysis=analysis_text,
@@ -258,6 +312,11 @@ def analyze_all(captures: list[StopCapture]) -> list[AnalysisResult]:
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main() -> None:
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        print("ERROR: ANTHROPIC_API_KEY not set. Fill in your .env file.")
+        sys.exit(1)
+
     drone = Tello()
 
     print("Connecting to Tello...")
@@ -268,12 +327,25 @@ def main() -> None:
 
     min_safe = BATTERY_THRESHOLD + 15
     if battery < min_safe:
-        print(f"Battery too low to safely fly ({battery}% < {min_safe}%). Charge first.")
+        print(f"Battery too low ({battery}% < {min_safe}%). Charge first.")
         sys.exit(1)
 
+    print(f"\nMission plan:")
+    print(f"  Greenhouse length: {GREENHOUSE_LENGTH} cm  ({GREENHOUSE_LENGTH / 100:.2f} m)")
+    print(f"  Rack stops/pass:   {RACK_STOPS}  ({STOP_DISTANCE} cm apart)")
+    print(f"  Shelf 1 height:    {SHELF1_HEIGHT} cm  (45 in) — fly LEFT")
+    print(f"  Shelf 2 height:    {SHELF2_HEIGHT} cm  (70 in) — fly RIGHT")
+    print(f"  Hover/stop:        {HOVER_SECONDS} sec + {FRAMES_PER_STOP}-frame capture")
+    print(f"  AI model:          {CLAUDE_MODEL}  (analysis runs after landing)")
+    print(f"  RTH threshold:     {BATTERY_THRESHOLD}%")
+
+    confirm = input("\nReady to fly? Type 'yes' to proceed: ").strip().lower()
+    if confirm != "yes":
+        print("Cancelled. No flight occurred.")
+        sys.exit(0)
+
     drone.streamon()
-    # Give the stream 2 seconds to stabilize so the first frame isn't garbage
-    time.sleep(2)
+    time.sleep(2)  # let stream stabilize before first frame
 
     captures: list[StopCapture] = []
 
@@ -297,15 +369,15 @@ def main() -> None:
             pass
         raise
 
-    # Drone is on the ground — now we can take as long as we need
     results = analyze_all(captures)
 
-    print("\n── Mission Complete ─────────────────────────")
-    print(f"  Stops captured:   {len(captures)} / {RACK_STOPS}")
+    final_battery = drone.get_battery()
+    print("\n── Mission Complete ─────────────────────────────────────")
+    print(f"  Stops captured:   {len(captures)} / {RACK_STOPS * 2}")
     print(f"  Analyses logged:  {len(results)}")
     print(f"  Log file:         {LOG_FILE}")
-    print(f"  Final battery:    {drone.get_battery()}%")
-    print("─────────────────────────────────────────────")
+    print(f"  Final battery:    {final_battery}%")
+    print("─────────────────────────────────────────────────────────")
 
 
 if __name__ == "__main__":
