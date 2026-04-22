@@ -27,6 +27,9 @@ import time
 import anthropic
 import cv2
 from djitellopy import Tello
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # ── Config — edit these to match your greenhouse layout ──────────────────────
 RACK_STOPS        = 3     # number of rack positions to visit

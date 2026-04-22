@@ -93,17 +93,21 @@ pip install djitellopy anthropic opencv-python
 
 ### 3. Set your Anthropic API key
 
-**Windows:**
-```cmd
-set ANTHROPIC_API_KEY=sk-ant-...
-```
+Copy the provided `.env.example` to a new file called `.env`:
 
-**Mac / Linux:**
 ```bash
-export ANTHROPIC_API_KEY=sk-ant-...
+cp .env.example .env
 ```
 
-> To make this permanent on Windows, add it to your System Environment Variables. On Mac/Linux, add the export line to your `~/.bashrc` or `~/.zshrc`.
+Open `.env` and replace the placeholder with your real key:
+
+```
+ANTHROPIC_API_KEY=sk-ant-your-actual-key-here
+```
+
+The scripts load this file automatically on startup via `python-dotenv`. The `.env` file is listed in `.gitignore` and will never be committed to the repository.
+
+> Get your API key at [console.anthropic.com](https://console.anthropic.com).
 
 ### 4. Connect to the Tello
 

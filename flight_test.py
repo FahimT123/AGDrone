@@ -13,6 +13,7 @@ Set your Anthropic API key before running:
 """
 
 from djitellopy import Tello
+from dotenv import load_dotenv
 import anthropic
 import cv2
 import base64
@@ -22,6 +23,8 @@ import time
 import sys
 from datetime import datetime
 from pathlib import Path
+
+load_dotenv()
 
 # ── Config — edit these to match your greenhouse layout ──────────────────────
 RACK_STOPS        = 3     # 3 rack positions per pass (each shelf)
