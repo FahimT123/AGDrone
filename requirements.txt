@@ -1,0 +1,3 @@
+djitellopy
+anthropic
+opencv-python
