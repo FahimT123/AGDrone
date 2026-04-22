@@ -6,6 +6,7 @@ An autonomous drone system that flies a DJI Tello through a two-shelf greenhouse
 
 ## Table of Contents
 
+- [What This Project Does](#what-this-project-does)
 - [Overview](#overview)
 - [Hardware Requirements](#hardware-requirements)
 - [Software Requirements](#software-requirements)
@@ -18,6 +19,69 @@ An autonomous drone system that flies a DJI Tello through a two-shelf greenhouse
 - [Output and Reports](#output-and-reports)
 - [Safety Guidelines](#safety-guidelines)
 - [Troubleshooting](#troubleshooting)
+
+---
+
+## What This Project Does
+
+### The Problem It Solves
+
+In a greenhouse with multiple shelves of plant bins, someone has to walk the row regularly and check each plant for signs of disease, pest damage, dehydration, or poor growth. When you have dozens of bins across two shelves, this takes real time every day and it is easy to miss early warning signs. Catching a problem late means losing plants that could have been saved.
+
+AGDrone automates that inspection entirely. You launch the script, the drone flies itself through the greenhouse, photographs every bin, and delivers a written health report — all without anyone walking the row.
+
+---
+
+### What Actually Happens, Step by Step
+
+**Before the drone moves:**
+The script connects to the Tello over Wi-Fi, reads the current battery level, and prints the full flight plan to your terminal — how far it will fly, how high, how many stops, and which AI model it will use. You have to manually type `yes` to approve the flight. If the battery is too low it refuses to take off.
+
+**Takeoff and first shelf:**
+The drone lifts off and climbs to **45 inches (114 cm)** above the ground. This is the height of the first shelf — the drone is now level with the plant bins on the lower rack. It then begins flying **left** across the full length of the greenhouse (355 cm).
+
+**Stopping at each bin:**
+The row has **3 rack positions**, spaced 118 cm apart. At every position the drone stops, holds position for 3 seconds to let the air settle and the image stabilize, then takes a photo of the plant bin directly in front of it. That photo is immediately sent to **Claude AI**, which reads the image and gives a written assessment of the plants in that bin — whether they look healthy, whether there are any visible problems like yellowing or spots, what growth stage they appear to be in, and whether any action is needed.
+
+This happens at all 3 stops on the first shelf as the drone works its way left across the greenhouse.
+
+**Rising to the second shelf:**
+After the third stop on shelf 1, the drone climbs an additional 64 cm, reaching **70 inches (178 cm)** above the ground. It is now level with the bins on the upper rack.
+
+**Second shelf pass — flying back:**
+The drone then flies **right**, back across the same 355 cm it just covered, this time analyzing the 3 bins on the upper shelf. Because it flies right on the return trip, it ends up back at the exact position it started from. The whole second shelf is inspected on what is effectively the return flight home.
+
+**Landing and report:**
+The drone lands at the starting position. All 6 captured images (3 per shelf) and all 6 Claude analyses are saved to a timestamped folder on your computer as both a structured JSON file and a plain text report you can read immediately.
+
+---
+
+### What the AI Tells You
+
+At every single bin stop, Claude receives the photo and answers four questions:
+
+1. **Overall health** — is this plant healthy, stressed, or showing signs of disease?
+2. **Visible issues** — any yellowing leaves, brown spots, wilting, curling, or signs of pests?
+3. **Growth stage** — is the plant seedling, early vegetative, mid-vegetative, flowering, etc.?
+4. **Recommended action** — does anything need attention, or is the current care schedule fine?
+
+This means after one flight you have a written diagnosis for every bin in the greenhouse, not just a photo to interpret yourself.
+
+---
+
+### The Two Scripts and Why There Are Two
+
+**`flight_test.py`** — the drone calls Claude at each stop *while it is still flying*. You see the analysis printed to your terminal in real time as the mission runs. This is the main script for normal use.
+
+**`greenhouse_monitor.py`** — the drone flies the full path first, storing all the frames in memory without making any API calls. Once it has landed safely, it sends all the photos to Claude and prints the results. This approach keeps the flight loop completely free of network delays, which makes the hovering and timing more consistent. Use this if your Wi-Fi connection is unreliable or if you want to guarantee the drone spends the minimum time in the air.
+
+Both scripts produce the same plant health information — the only difference is *when* the AI analysis happens relative to the flight.
+
+---
+
+### Why This Matters
+
+Manual greenhouse inspection is time-consuming, inconsistent, and easy to skip when you are busy. This system turns it into a one-command task. Run it every morning and you have a dated record of every plant's condition over time. Early problems get caught on day one instead of day five when they have already spread.
 
 ---
 
